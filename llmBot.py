@@ -3,15 +3,20 @@ import time
 import string
 import wikipediaapi
 from funcs import *
+from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings, ChatNVIDIA
+from langchain.memory import ConversationBufferMemory
+import os
+import getpass
+import difflib
 
-class WikiGameBot():
+
+class WikiGameLLMBot():
     """
     A class to simulate playing the 'Wiki Game', an online game where players start from one Wikipedia article 
     and try to navigate to another target article using as few hyperlinks as possible within Wikipedia.
 
-    This class connects to the Wikipedia API to fetch and analyze Wikipedia pages. It keeps track of the 
-    game's progress, including the start and target topics, the current topic, turn number, time taken per turn, 
-    and the similarity between the current and target topics.
+    This class LLMs to the Wikipedia API to fetch and analyze Wikipedia pages. It keeps track of the 
+    game's progress, including the start and target topics, the current topic, and turn number.
 
     Attributes
     ----------
@@ -45,7 +50,7 @@ class WikiGameBot():
     AssertionError
         If the start and target topics are the same, an assertion error is raised.
     """
-    def __init__(self, wiki_wiki, start_topic = None, target_topic = None):
+    def __init__(self, wiki_wiki, start_topic = None, target_topic = None, model_name='meta/llama3-70b-instruct', temperature=0.1):
         """
         Initializes the WikiGameBot with the start and target topics.
 
@@ -66,6 +71,18 @@ class WikiGameBot():
         AssertionError
             If the start and target topics are the same, an assertion error is raised.
         """
+        if not os.environ.get("NVIDIA_API_KEY", "").startswith("nvapi-"):
+            nvidia_api_key = getpass.getpass("Enter your NVIDIA API key: ")
+            assert nvidia_api_key.startswith("nvapi-"), f"{nvidia_api_key[:5]}... is not a valid key"
+            os.environ["NVIDIA_API_KEY"] = nvidia_api_key
+        else:
+            nvidia_api_key = os.environ["NVIDIA_API_KEY"]
+            
+        self.llm = ChatNVIDIA(model       = model_name,
+                              api_key     = nvidia_api_key,
+                              temperature = temperature,
+                             )
+        self.memory = ConversationBufferMemory(ai_prefix="System")
 
         self.wiki_wiki = wiki_wiki
         
@@ -74,29 +91,16 @@ class WikiGameBot():
             'starting_topic': [],   # to be able to calculate distance from starting topic to current topic
             'target_topic': [],     # to be able to calculate distance from target topic to current topic
             'turn': [],             # int of this turn (so things are sortable)
-            'turn_time': [],        # time in seconds to perform steps at this turn
             'current_topic': [],    # current topic
-            'current_summary': [],  # summary for current topic
-            'similarity_to_target': [],  # similarity to target
-            'embedding': [],        # topic summary embedding
+            'current_summary': []
         }
+        self.printouts = []
 
         # get start and target topics and their respective summaries
         self.get_topics(start_topic, target_topic) # defines self.start_topic and self.target_topic
         assert self.start_topic != self.target_topic, "Please enter different start and target topics."
         
         target_page = self.wiki_wiki.page(self.target_topic)
-        self.current_summary = "" # this is overwritten after game starts
-        self.target_summary = get_page_summary(target_page)
-        self.current_embedding = None
-        self.printouts = []
-
-        # running value of topic that is most similar to the target
-        self.most_similar_to_target = {
-            'topic' : None,
-            'summary' : None,
-            'similarity' : 0,
-        }
 
     def log_turn(self, turn_dict):
         """
@@ -162,39 +166,43 @@ class WikiGameBot():
         self.current_summary = get_page_summary(current_page) # not the best but this works
 
         # get top n valid pages from all linked pages
-        top_n = 20
         pages = [page for page in validate_pages(current_page) if page not in visited]
+        pages = pages[:25]
         if self.target_topic in pages:
             return self.target_topic, 1
-        embs, top_n_pages, _ = get_most_similar_strings(self.target_summary, pages, n = top_n)
 
-        # get the summary of top_n // 2 pages and get the most similar summary to target summary
-        top_n_summaries_to_pages = {get_page_summary(self.wiki_wiki.page(page)).strip() : page for page in top_n_pages[: top_n // 2] if get_page_summary(self.wiki_wiki.page(page)).strip()}
-        top_n_pages_to_summaries = {page : summary for summary, page in top_n_summaries_to_pages.items()}
-        embs, top_n_pages, top_n_similarities = get_most_similar_strings(self.target_summary, list(top_n_summaries_to_pages.keys()), n = top_n)
-        most_similar_topic, similarity_to_target = top_n_summaries_to_pages[top_n_pages[0]], top_n_similarities[0]
-        most_similar_emb = embs[top_n_pages_to_summaries[most_similar_topic]]
-        self.current_embedding = most_similar_emb
+        # Select the base pages with the llm
+        template = """You must are playing the Wikipedia Game where you must find a chain of
+Wikipedia pages that connect a source topic to a target topic. Your source topic was {source}
+and your target topic is {target1}. You are currently at the topic of {current}, and you must select
+a new topic from the linked pages here that will make it likely for you to connect to the target topic
+soon. Your possible choices are:
 
-        ### if similarity to target is less than the current most similar of the run thus far,
-        # calculate similarities between all summary embeddings and embedding for the previously most similar topic
-        # this serves as a way to potentially redirect from topic rabbit holes
-        # this checks if last 3 similarity values were each trending down (returns bool)
-        trending_down_3 = all(self.game_log['similarity_to_target'][i] < self.game_log['similarity_to_target'][i - 1] for i in range(len(self.game_log['similarity_to_target']) - 1, len(self.game_log['similarity_to_target']) - 3, -1)) if len(self.game_log['similarity_to_target']) >= 3 else False
-        if similarity_to_target < self.most_similar_to_target['similarity'] and similarity_to_target < 0.3 and trending_down_3:
-            embs, top_n_pages, top_n_similarities = get_most_similar_strings(self.most_similar_to_target['summary'], list(top_n_summaries_to_pages.keys()), n = top_n)
-            most_similar_topic, similarity_to_target = top_n_summaries_to_pages[top_n_pages[0]], top_n_similarities[0]
-            most_similar_emb = embs[top_n_pages_to_summaries[most_similar_topic]]
-            self.current_embedding = most_similar_emb
-        else:
-            self.most_similar_to_target = {
-                'topic' : most_similar_topic,
-                'summary' : top_n_pages_to_summaries[most_similar_topic],
-                'embedding': most_similar_emb,
-                'similarity' : similarity_to_target,
-            }
+{links}
 
-        return most_similar_topic, similarity_to_target # return page topic whose summary that is most similar to target summary
+Select the topic above most likely to route you to {target2} as fast as possible. Format your output as:
+Next topic=<topic here>
+"""
+        template = template.format(source  = self.start_topic,
+                                   target1 = self.target_topic,
+                                   current = current_topic,
+                                   links   = '\n'.join(pages),
+                                   target2 = self.target_topic
+                                  )
+        print(template)
+        response = self.llm.invoke(template)
+        print("Response")
+        print(response)
+        
+        print("Parsed Response")
+        proposedPage = response.content.split('=')[1]
+        print(proposedPage)
+        
+        print("Most similar page")
+        most_similar = difflib.get_close_matches(proposedPage, pages, n=1)[0]
+        print(most_similar)
+
+        return most_similar
     
     def play_game(self, verbose = True):
         """
@@ -228,7 +236,7 @@ class WikiGameBot():
 
             # find most similar topic on current page to target topic
             visited.add(current_topic)
-            next_topic, similarity_to_target = self.take_turn(current_topic, list(visited))
+            next_topic = self.take_turn(current_topic, list(visited))
 
             # for turn time tracking
             turn_time = time.time() - turn_start
@@ -239,39 +247,25 @@ class WikiGameBot():
                     'target_topic': self.start_topic,
                     'turn': turn_num,             
                     'current_topic': current_topic,
-                    'current_summary': self.current_summary,
-                    'similarity_to_target': similarity_to_target,
-                    'embedding': self.current_embedding,
-                    'turn_time': round(turn_time, 2),
+                    'current_summary': self.current_summary
                 }
             )
-
 
             if verbose:
                 printouts = [
                     "-" * 50,
                     f"Turn: {turn_num}",
-                    f"Turn time: {round(turn_time, 2)}s",
-                    f"Total time: {round(sum(self.game_log['turn_time']), 2)}s",
                     f"Start topic: {self.start_topic.replace('_', ' ')}",
                     f"Current topic: {current_topic.replace('_', ' ')}",
                     f"Next topic: {next_topic.replace('_', ' ')}",
                     f"Target topic: {self.target_topic.replace('_', ' ')}",
-                    f"Current similarity to target: {round(similarity_to_target, 2)}",
-                    "-" * 50,
                 ]
 
                 self.printouts.append(printouts)
-                
+
                 # print progress
                 for i in self.printouts[-1]:
-                    st.write(i)
-
-            # if same as target topic, game is done
-            if current_topic.lower().strip() == self.target_topic.replace('_', ' ').lower().strip():
-                st.write(f"Congratulations! WikiGameBot has finished the game in {turn_num} turns, in {round(sum(self.game_log['turn_time']), 2)} seconds!")
-                st.write(f"Average topic similarity was {round(sum(self.game_log['similarity_to_target']) / len(self.game_log['similarity_to_target']), 2)}.")
-                break
+                    print(i)
 
             # else, set new next_topic to current topic and loop
             current_topic = next_topic

@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 import numpy as np
 from scipy.spatial.distance import cosine
 from sentence_transformers import SentenceTransformer
-model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+# model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
 def get_page_summary(wiki_page):
     """
